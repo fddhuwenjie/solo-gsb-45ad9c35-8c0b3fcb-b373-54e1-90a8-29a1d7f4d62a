@@ -11,7 +11,14 @@
 - 双页面交错：A 页核准成功后，B 页的航线保存被拒绝且不会用 B 页缓存的
   旧禁飞区覆盖 A 页已核准内容；B 页核准也必须使用最新修订号；
 - 保存与核准相邻：保存先落库后，核准须用保存返回的新修订号（旧号 409）；
-- 核准通过/失败均不改写发布快照。
+- 核准通过/失败均不改写发布快照；
+- 启动竞态（GET /api/state 先、GET /api/release 后，期间他页推进修订号）：
+  再次 GET /api/state 失败时页面不得放行待发保存（用 /api/release 学到的
+  新修订号会把编辑前所见旧航线/旧禁飞区整份写回且服务端会返回 200），
+  必须保留本页航线/禁飞区草稿并阻断自动保存及相邻核准/发布，重试取回最新
+  工作区后再分流：合入他页已核准禁飞区但草稿不落库；仅他页改航线时直接
+  采用远端航线且不写库；双方都改航线才进入冲突选择，确认提交按最新修订号
+  条件保存。
 """
 import json
 import os
@@ -97,6 +104,22 @@ class WorkspaceConcurrencyTests(unittest.TestCase):
     def publish(self, client, vid, rev, seq):
         return client.post("/api/release", json={
             "versionId": vid, "workspaceRev": rev, "releaseSeq": seq})
+
+    def release_info(self, client):
+        r = client.get("/api/release")
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()
+
+    def publish_route_route_in_workspace(self, client):
+        """发布 #1（快照航线 ROUTE），并让发布后工作区航线也为 ROUTE。
+
+        返回 (vid, rev, seq)；此时他页核准禁飞区/改航线都会推进修订号，
+        用于模拟“本页启动两次读取之间他页推进修订号”的竞态。
+        """
+        _, rev = self.publish_route(client)
+        rev = self.put_ok(client, {"route": clone(ROUTE), "nfzs": []}, rev)
+        r = client.get("/api/release").get_json()
+        return r["release"]["sourceVersionId"], rev, r["releaseSeq"]
 
     def publish_route(self, client):
         """以 ROUTE 发布 #1（工作区禁飞区为空），返回 (vid, rev)。"""
@@ -399,6 +422,243 @@ class WorkspaceConcurrencyTests(unittest.TestCase):
         self.assertEqual(st["route"]["waypoints"][1]["alt"], 300)
         # 自动保存/核准全程不改写发布快照
         self.assertEqual(self.release_snapshot(self.page_b), snap)
+
+    # —— 启动竞态：GET /api/state → GET /api/release 之间他页推进修订号 ——
+    # 下面的 StartupPage 严格按前端启动协调协议走 HTTP：
+    #   ① GET /api/state（记录 seenRev/基线航线/已核准禁飞区，可先在本页编辑）
+    #   ② GET /api/release（得到权威 workspaceRev；与 seenRev 不同必须协调）
+    #   ③ 协调再 GET /api/state：失败 → 阻断一切写入（coord_failed=True），
+    #      重试成功后再分流；成功 → 合入已核准禁飞区（草稿不落库），并按
+    #      本页/远端航线是否相对基线变化分流（远端未变→条件保存；仅远端变
+    #      →采用远端不写库；双方都变→挂起冲突，确认提交才条件写入）。
+    class StartupPage:
+        def __init__(self, outer, client):
+            self.o = outer
+            self.c = client
+            self.route = None
+            self.nfzs = None
+            self.saved_nfzs = None
+            self.base_route = None
+            self.seen_rev = None
+            self.rev = None
+            self.seq = None
+            self.coord_failed = False
+            self.route_conflict = None
+            self.puts = 0   # 协调/重试期间发出的 PUT /api/state 次数
+
+        def get_state(self):
+            st, rev = self.o.get_state(self.c)
+            self.route, self.nfzs = st["route"], st["nfzs"]
+            self.saved_nfzs = clone(self.nfzs)
+            self.base_route = clone(self.route)
+            # 编辑前已核准禁飞区基线：协调时据此判断本页是否存在禁飞区草稿
+            self._nfz_baseline = clone(self.nfzs)
+            self.seen_rev = self.rev = rev
+            return st
+
+        def edit_route(self, **changes):
+            self.route = clone(self.route)
+            self.route.update(changes)
+
+        def edit_nfz_draft(self, nfzs):
+            self.nfzs = clone(nfzs)  # 已有发布：仅页面草稿，不进任何请求体
+
+        def load_release_and_coordinate(self, coord_fails=0):
+            info = self.o.release_info(self.c)
+            self.seq = info["releaseSeq"]
+            if isinstance(info["workspaceRev"], int):
+                self.rev = info["workspaceRev"]
+            if self.rev == self.seen_rev:
+                return
+            self._coordinate(failures_left=coord_fails)
+
+        def _coordinate(self, failures_left):
+            if failures_left > 0:
+                self.coord_failed = True
+                return
+            st, fresh_rev = self.o.get_state(self.c)
+            self.coord_failed = False
+            remote_route, remote_nfzs = st["route"], st["nfzs"]
+            remote_changed = remote_route != self.base_route
+            local_changed = self.route != self.base_route
+            # 任何情况下先合入他页已核准禁飞区：有草稿时只换基线，草稿不落库
+            self.saved_nfzs = clone(remote_nfzs)
+            if self.nfzs == self._nfz_baseline:
+                self.nfzs = clone(remote_nfzs)
+            if not remote_changed:
+                self.rev = fresh_rev
+                if not local_changed:
+                    self.route = clone(remote_route)
+                self.base_route = clone(remote_route)
+                if local_changed:
+                    self._save_route()
+            elif not local_changed:
+                self.rev = fresh_rev
+                self.route = clone(remote_route)
+                self.base_route = clone(remote_route)
+            else:
+                self.rev = fresh_rev
+                self.base_route = clone(remote_route)
+                self.route_conflict = clone(remote_route)
+
+        def retry_coordination(self, failures_left=0):
+            self.o.assertTrue(self.coord_failed)
+            self._coordinate(failures_left=failures_left)
+
+        def _save_route(self):
+            # 已发布航线条件保存：请求体只含本页航线 + 已核准禁飞区基线，
+            # 绝不携带本页草稿；携带所见最新修订号
+            self.puts += 1
+            r = self.o.put(self.c,
+                           {"route": self.route, "nfzs": clone(self.saved_nfzs)},
+                           self.rev)
+            if r.status_code == 200:
+                self.rev = r.get_json()["rev"]
+                self.base_route = clone(self.route)
+                self.route_conflict = None
+            else:
+                self.o.assertEqual(r.status_code, 409, r.get_json())
+            return r
+
+        def pending_save(self):
+            """协调期间被挡下的待发保存：仅在未失败/未挂冲突时才允许发出。"""
+            if self.coord_failed or self.route_conflict:
+                return None
+            return self._save_route()
+
+        def approve_draft(self, nfzs):
+            if self.coord_failed:
+                return None  # 前端：协调失败期间相邻核准写入一律阻断
+            return self.o.approve(self.c, nfzs, self.rev, self.seq)
+
+        def resolve_conflict_submit_local(self):
+            self.o.assertIsNotNone(self.route_conflict)
+            self.route_conflict = None
+            return self._save_route()
+
+    def test_startup_coord_fetch_failure_blocks_writes_until_retry(self):
+        # 前置：发布 #1，发布后工作区航线为 ROUTE，禁飞区为空，修订号 rev0
+        _, rev0, _ = self.publish_route_route_in_workspace(self.page_a)
+        page = self.StartupPage(self, self.page_b)
+        page.get_state()               # ① 先读工作区：seen_rev=rev0
+        page.edit_route(corridorHalfWidth=0.5)                 # 本页改了航线
+        page.edit_nfz_draft([clone(FAR_NFZ)])                 # 本页禁飞区草稿
+
+        # 他页在两次读取之间核准禁飞区（修订号推进到 rev0+1）
+        r = self.approve(self.page_a, [clone(FAR_NFZ)], rev0, 1)
+        self.assertEqual(r.status_code, 200, r.get_json())
+
+        # ② 读发布状态拿到新修订号；③ 协调再 GET 失败 → 阻断
+        page.load_release_and_coordinate(coord_fails=1)
+        self.assertTrue(page.coord_failed)
+        # 关键：失败期间待发保存/相邻核准一律不得发出
+        self.assertIsNone(page.pending_save())
+        self.assertIsNone(page.approve_draft([clone(FAR_NFZ)]))
+        self.assertEqual(page.puts, 0)
+        st, hdr = self.get_state(self.page_b)
+        self.assertEqual(hdr, rev0 + 1)
+        self.assertEqual(st["nfzs"], [FAR_NFZ])     # 他页已核准内容完好
+        self.assertEqual(st["route"], ROUTE)
+        # 本页草稿仍在手里（航线编辑、禁飞区草稿都未丢）
+        self.assertEqual(page.route["corridorHalfWidth"], 0.5)
+        self.assertEqual(page.nfzs, [FAR_NFZ])
+
+        # 重试取回最新工作区：远端航线未变（仅禁飞区被核准）→ 合入已核准
+        # 禁飞区基线、用最新修订号条件保存本页航线；草稿不进请求体
+        page.retry_coordination(failures_left=0)
+        self.assertFalse(page.coord_failed)
+        self.assertEqual(page.puts, 1)
+        st, hdr = self.get_state(self.page_b)
+        self.assertEqual(hdr, rev0 + 2)
+        self.assertEqual(st["route"]["corridorHalfWidth"], 0.5)
+        self.assertEqual(st["nfzs"], [FAR_NFZ])     # 基线合入，非草稿写回
+        # 草稿与已核准内容一致与否都不影响服务端：随后核准空草稿会替换禁飞区
+        r = self.approve(self.page_b, [], hdr, 1)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        st, hdr2 = self.get_state(self.page_b)
+        self.assertEqual(st["nfzs"], [])
+        self.assertEqual(st["route"]["corridorHalfWidth"], 0.5)
+
+    def test_startup_coord_failure_then_retry_sees_remote_route_change(self):
+        # 他页在两次读取之间改了航线（并顺带核准了禁飞区）；本页航线未改：
+        # 重试取回后应直接采用远端航线，不发任何 PUT，已核准禁飞区合入
+        _, rev0, _ = self.publish_route_route_in_workspace(self.page_a)
+        page = self.StartupPage(self, self.page_b)
+        page.get_state()
+        page.edit_nfz_draft([clone(FAR_NFZ)])  # 只有禁飞区草稿，航线没动
+
+        route_a = clone(ROUTE); route_a["corridorHalfWidth"] = 0.42
+        rev1 = self.put_ok(self.page_a, {"route": route_a, "nfzs": []}, rev0)
+        r = self.approve(self.page_a, [clone(FAR_NFZ)], rev1, 1)
+        self.assertEqual(r.status_code, 200, r.get_json())
+
+        page.load_release_and_coordinate(coord_fails=1)
+        self.assertTrue(page.coord_failed)
+        self.assertIsNone(page.pending_save())     # 失败期间不写
+        page.retry_coordination(failures_left=0)
+        self.assertFalse(page.coord_failed)
+        self.assertEqual(page.puts, 0)             # 直接采用远端航线：无需写库
+        self.assertEqual(page.route, route_a)
+        self.assertEqual(page.saved_nfzs, [FAR_NFZ])  # 已核准禁飞区合入基线
+        self.assertEqual(page.nfzs, [FAR_NFZ])         # 草稿恰好同形，仍只作草稿
+        st, hdr = self.get_state(self.page_b)
+        self.assertEqual(hdr, rev1 + 1)
+        self.assertEqual(st["route"], route_a)
+
+    def test_startup_coord_both_routes_changed_enters_conflict_choice(self):
+        # 双方都改航线：重试取回后挂起冲突，不放行待发保存；用户确认提交后
+        # 才用最新修订号条件写入本页航线（禁飞区沿用已核准基线，草稿不落库）
+        _, rev0, _ = self.publish_route_route_in_workspace(self.page_a)
+        page = self.StartupPage(self, self.page_b)
+        page.get_state()
+        page.edit_route(unitScale=200)
+        page.edit_nfz_draft([clone(FAR_NFZ)])
+
+        route_a = clone(ROUTE); route_a["corridorHalfWidth"] = 0.42
+        rev1 = self.put_ok(self.page_a, {"route": route_a, "nfzs": []}, rev0)
+
+        page.load_release_and_coordinate(coord_fails=1)
+        page.retry_coordination(failures_left=0)
+        self.assertIsNotNone(page.route_conflict)   # 进入冲突选择
+        self.assertIsNone(page.pending_save())      # 自动保存仍暂停
+        self.assertEqual(page.puts, 0)
+        self.assertEqual(page.nfzs, [FAR_NFZ])      # 草稿保留
+        self.assertEqual(page.saved_nfzs, [])       # 远端禁飞区基线（无核准）
+        # 确认提交本页航线：最新修订号条件写入，请求体禁飞区为已核准基线 []
+        r = page.resolve_conflict_submit_local()
+        self.assertEqual(r.status_code, 200, r.get_json())
+        st, hdr = self.get_state(self.page_b)
+        self.assertEqual(hdr, rev1 + 1)
+        self.assertEqual(st["route"]["unitScale"], 200)
+        self.assertEqual(st["route"]["corridorHalfWidth"], 0.3)  # 本页未改此项
+        self.assertEqual(st["nfzs"], [])            # 草稿从未落库
+
+    def test_startup_new_rev_with_stale_payload_is_accepted_without_coord(self):
+        # 记录被修复的危害本身（服务端无法替前端判断“旧航线”）：若协调失败时
+        # 仍放行待发保存，前端用 /api/release 学到的新修订号携带编辑前所见的
+        # 旧航线 + 旧禁飞区条件 PUT，服务端会 200 接受——他页航线改动与已
+        # 核准禁飞区被整份覆盖。因此前端必须在再 GET 失败时阻断（上一条用例）。
+        _, rev0, _ = self.publish_route_route_in_workspace(self.page_a)
+        # 本页启动读到 rev0 / ROUTE / []
+        st_b, rev_b = self.get_state(self.page_b)
+        self.assertEqual(rev_b, rev0)
+        # 他页改航线并核准禁飞区，修订号推进两次
+        route_a = clone(ROUTE); route_a["corridorHalfWidth"] = 0.42
+        rev1 = self.put_ok(self.page_a, {"route": route_a, "nfzs": []}, rev0)
+        r = self.approve(self.page_a, [clone(FAR_NFZ)], rev1, 1)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        rev_after = r.get_json()["rev"]
+        info = self.release_info(self.page_b)
+        self.assertEqual(info["workspaceRev"], rev_after)
+        # 危险写法（修复前前端在协调再 GET 失败时会这么发）：新号 + 旧内容
+        r = self.put(self.page_b,
+                     {"route": clone(st_b["route"]), "nfzs": clone(st_b["nfzs"])},
+                     rev_after)
+        self.assertEqual(r.status_code, 200, r.get_json())  # 条件头“恰好最新”→ 覆盖成功
+        st, hdr = self.get_state(self.page_b)
+        self.assertEqual(hdr, rev_after + 1)
+        self.assertEqual(st["route"], ROUTE)       # 他页航线改动被旧内容抹掉
+        self.assertEqual(st["nfzs"], [])           # 他页已核准禁飞区被旧内容抹掉
 
 
 if __name__ == "__main__":

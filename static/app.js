@@ -31,6 +31,11 @@ let routeConflict = null;   // 双方都改航线时的未解决冲突；非空�
 // 发布状态读取失败期间被挡下的防抖保存：编辑仍在页面。重试读到明确状态后
 // 据此补一次防抖保存（loading 期间的保存会在就绪承诺放行后自行发出，无需补）
 let writesWithheld = false;
+// 启动协调（GET /api/state → GET /api/release 间修订号推进）取回最新工作区
+// 失败：true 期间本页航线/禁飞区草稿保留，一切工作区写请求阻断直到重试成功
+let workspaceCoordError = false;
+// 启动协调发现分歧时 GET /api/state 读到的旧修订号，供“重试”再次协调使用
+let coordSeenRev = null;
 
 // 409 分流后确认“双方都改了航线”：保存中止并抛出本哨兵，
 // 调用方据此知道冲突面板已展示、不得把它当作保存成功继续核准/发布
@@ -44,15 +49,30 @@ class ReleaseUnavailableError extends Error {
   constructor(msg) { super(msg || "release status unavailable"); this.name = "ReleaseUnavailableError"; }
 }
 
+// 启动协调失败：GET /api/state 与 GET /api/release 之间修订号已被他页推进，
+// 但取回最新工作区的再次 GET /api/state 失败。此时绝不能放行待发保存
+// （否则会用 /api/release 的新修订号把旧航线/旧禁飞区整份条件写回）：
+// 本页航线与禁飞区草稿保留，自动保存及相邻核准/发布写入一律阻断，
+// 侧栏提供“重试”，取回最新工作区分流成功后才恢复
+class WorkspaceCoordError extends Error {
+  constructor() {
+    super("workspace coordination fetch failed");
+    this.name = "WorkspaceCoordError";
+  }
+}
+
 // 重置/生成“发布状态就绪”承诺：初始与用户点刷新时各调用一次
 function resetReleaseReady() {
   releaseReady = new Promise((resolve) => { resolveReleaseReady = resolve; });
 }
 // 等待发布状态明确；明确前调用方不得发起任何工作区写请求。
 // 读取失败时 reject（不得当作“从无发布”）；重试成功后该承诺会随新承诺放行。
+// 启动协调失败（workspaceCoordError）同样 reject：保留草稿、阻断所有写入，
+// 直到用户点“重试”取回最新工作区分流成功。
 // 其余返回 published / none
 async function waitReleaseReady() {
   const s = await releaseReady;
+  if (workspaceCoordError) throw new WorkspaceCoordError();
   if (s !== "published" && s !== "none") {
     throw new ReleaseUnavailableError(s === "error"
       ? "发布状态读取失败，请刷新页面后重试" : "发布状态尚未确认");
@@ -185,42 +205,89 @@ function presentRouteConflict(remoteState, remoteRev) {
 }
 
 // 发布状态确认后，若 GET /api/state 与 GET /api/release 两次读取之间工作区
-// 修订号已变，不得把新修订号配旧航线写回。取回最新工作区，按已有分流口径
-// 处理：合入他页已核准禁飞区（本页有草稿则只换基线、草稿不落库）；
-// 服务器航线未变 → 只更新所见基线与修订号；双方航线都变 → 走现有航线冲突
-// 流程（暂停自动保存、并列双方航线供选择，草稿保留）。
-// 返回 true 表示已无分歧可继续条件保存；false 表示已走冲突分流，必须中止。
+// 修订号已变，不得把新修订号配旧航线写回。取回最新工作区，按分流口径处理：
+//   · 合入他页已核准禁飞区（本页有草稿则只换基线、草稿不落库）；
+//   · 服务器航线未变（仅禁飞区获核准，或本页改航线而远端未改）：采用最新
+//     修订号，本页航线随后按最新修订号条件保存即可；
+//   · 仅他页改航线（本页航线仍与编辑前所见一致）：直接采用远端航线，无需写库；
+//   · 双方都改航线：走现有冲突选择流程（暂停自动保存、并列双方航线供选择，
+//     草稿保留）。
+// 返回 "ok" 表示已无分歧可放行写请求；"conflict" 表示已走冲突分流，必须中止
+// 待发保存；"failed" 表示再次 GET /api/state 失败——保留本页航线与禁飞区草稿，
+// 工作区写请求继续阻断（workspaceCoordError 置位），由用户点“重试”取回最新
+// 工作区后再分流，绝不用“新修订号 + 旧航线/旧禁飞区”整份写回。
 async function reconcileWorkspaceRevIfPublished(seenRev) {
-  if (releaseState !== "published") return true;
-  if (workspaceRev === seenRev) return true;
+  if (releaseState !== "published") return "ok";
+  if (workspaceRev === seenRev) return "ok";
+  coordSeenRev = seenRev;
   let fresh, freshState;
   try {
     fresh = await fetch("/api/state");
+    if (!fresh.ok) throw new Error("HTTP " + fresh.status);
     freshState = await fresh.json();
   } catch (e) {
-    // 取不回最新工作区时不阻断：workspaceRev 已采用 /api/release 的权威值，
-    // 后续航线条件保存若仍过时，会由 PUT 的 409 三分流安全处理，
-    // 绝不在此用“新修订号 + 旧航线”直接写回
-    return true;
+    // 协调所需的再次 GET 失败：不放行任何工作区写请求。workspaceRev 虽已采用
+    // /api/release 的权威值，但此刻拿它条件保存就会把编辑前所见的旧航线与
+    // 旧禁飞区整份写回（他页可能已核准禁飞区、改航线并推进修订号，条件 PUT
+    // 会成功而非 409）。保留本页草稿并阻断，待重试取回最新工作区后再分流。
+    workspaceCoordError = true;
+    renderRelease();
+    renderNfzDraft();
+    return "failed";
   }
+  workspaceCoordError = false;
   const freshRev = parseInt(fresh.headers.get("X-Workspace-Rev") || "0", 10) || workspaceRev;
   const remoteRoute = freshState.route || {};
+  const remoteRouteChanged = !sameJson(remoteRoute, serverRouteSeen);
+  const localRouteChanged = !sameJson(state.route, serverRouteSeen);
   // 任何情况下先合入他页已核准禁飞区（草稿保留在画布，绝不落库）
   adoptServerNfzs(freshState.nfzs || []);
-  if (sameJson(remoteRoute, serverRouteSeen)) {
-    // 只有禁飞区在他页获核准（或同样的航线被重写）：采用最新修订号，
-    // 本页航线随后按所见最新修订号条件保存即可
+  if (!remoteRouteChanged) {
+    // 仅他页核准禁飞区（航线相同）：采用最新修订号；本页改了航线时随后按
+    // 最新修订号条件保存，本页未改则无需写库
     workspaceRev = freshRev;
-    if (sameJson(state.route, serverRouteSeen)) state.route = clone(remoteRoute);
+    if (!localRouteChanged) state.route = clone(remoteRoute);
     serverRouteSeen = clone(remoteRoute);
     renderPanel(); renderBoard(); runAnalyze(); renderNfzDraft();
-    return true;
+    return "ok";
+  }
+  if (!localRouteChanged) {
+    // 仅他页改航线：直接采用远端航线（无需写库），禁飞区草稿已在上文保留
+    workspaceRev = freshRev;
+    state.route = clone(remoteRoute);
+    serverRouteSeen = clone(remoteRoute);
+    renderPanel(); renderBoard(); runAnalyze(); renderNfzDraft();
+    toast("检测到他页已保存新航线，已加载服务器最新航线（本页禁飞区草稿保留）");
+    return "ok";
   }
   // 双方航线都变：沿现有冲突选择流程，保留本页航线与禁飞区草稿
   presentRouteConflict(freshState, freshRev);
   toast("航线在他页也被修改：已暂停自动保存，请选择处理方式");
   renderPanel(); renderBoard(); runAnalyze(); renderNfzDraft();
-  return false;
+  return "conflict";
+}
+
+// 启动协调失败后用户点“重试”：重新取回最新工作区并按规则分流。
+// 成功后恢复写请求门（ready 承诺放行）并重放被挡下的待发保存；
+// 仍然失败则继续阻断、草稿保留；双方航线都变则进入冲突选择流程。
+async function retryWorkspaceCoordination() {
+  if (!workspaceCoordError) return;
+  const outcome = await reconcileWorkspaceRevIfPublished(
+    coordSeenRev == null ? workspaceRev : coordSeenRev);
+  if (outcome === "failed") {
+    toast("仍无法取回最新工作区，本页编辑已保留，写操作继续暂停，请稍后重试");
+    return;
+  }
+  workspaceCoordError = false;
+  const conflicted = outcome === "conflict";
+  renderRelease();
+  renderNfzDraft();
+  // 冲突分流时也放行就绪门：routeConflict 本身会暂停自动保存；用户二选一后
+  // 自动保存需要立即恢复，不能一直挂在就绪承诺上
+  resolveReleaseReady(releaseState);
+  replayWithheldWrite(conflicted);
+  if (conflicted) return;
+  toast("已取回最新工作区并完成协调，自动保存已恢复");
 }
 
 async function doSaveState() {
@@ -230,6 +297,9 @@ async function doSaveState() {
   if (releaseState !== "published" && releaseState !== "none") {
     throw new ReleaseUnavailableError();
   }
+  // 启动协调失败期间绝不写工作区：重试取回最新工作区分流成功前一律阻断，
+  // 避免用 /api/release 的新修订号把编辑前所见的旧航线/旧禁飞区整份写回
+  if (workspaceCoordError) throw new WorkspaceCoordError();
   if (routeConflict) throw new RouteConflictError();
   // 已有发布时：航线编辑仍自动保存，但禁飞区变更只存草稿，
   // 落库的禁飞区必须是已核准的 savedNfzs，不得顺带写入草稿内容；
@@ -257,6 +327,14 @@ async function doSaveState() {
   const localRoute = clone(state.route);
   const localDraft = clone(state.nfzs);
   const baseRoute = clone(serverRouteSeen);
+  // 协调分流后本页航线与已确认的服务器航线一致（如仅他页改航线后本页未再编辑、
+  // 或编辑又被撤销）：没有待保存的本地航线，绝不发起 PUT 把旧内容写回
+  if (sameJson(localRoute, baseRoute)) {
+    if (sameJson(state.route, localRoute)) state.route = localRoute;
+    serverRouteSeen = clone(localRoute);
+    renderNfzDraft();
+    return;
+  }
   let expectedRev = workspaceRev;
   let lastErr = null;
   // 条件写入；409 时取回服务器最新内容，按三种情况分流：
@@ -332,6 +410,9 @@ async function doSaveState() {
 async function saveStateNow() {
   clearTimeout(saveTimer);
   saveTimer = null;
+  // 启动协调失败时就绪承诺会一直挂起：显式抛出，由调用方（载入版本）提示
+  // 先点侧栏“重试”，而不是让保存承诺静默悬挂
+  if (workspaceCoordError) throw new WorkspaceCoordError();
   // 发布状态明确前不发工作区写请求；读取失败向上抛出，由调用方提示刷新
   await waitReleaseReady();
   // FIFO 队列保证不会与在途保存并发：后一个始终拿到前一个返回的修订号
@@ -351,11 +432,15 @@ function scheduleSave() {
       () => enqueue(() => doSaveState().catch((e) => {
         if (e instanceof RouteConflictError) return; // 冲突面板已提示，不再弹保存失败
         if (e instanceof ReleaseUnavailableError) return; // 已通过就绪门，理论上不会到这
+        if (e instanceof WorkspaceCoordError) {
+          noteWithheldWrite(); // 协调失败：草稿保留，重试取回后由 replay 统一补发
+          return;
+        }
         toast(e.message || "自动保存失败");
       })),
       () => {
-        // 发布状态读取失败：保留编辑，不写工作区；侧栏提示刷新，
-        // 重试读到明确状态后由 replayWithheldWrite 统一补发
+        // 发布状态读取失败或启动协调失败：保留编辑，不写工作区；侧栏提示
+        // 重试，重试取回明确状态/最新工作区后由 replayWithheldWrite 统一补发
         noteWithheldWrite();
       }
     );
@@ -908,16 +993,19 @@ async function loadRelease() {
     currentRelease = r.release;
     if (typeof r.workspaceRev === "number") workspaceRev = r.workspaceRev;
     renderRelease();
+    renderNfzDraft();
     // 两次读取之间修订号已变：先取回最新工作区（合入他页已核准禁飞区；
-    // 双方航线都变则走冲突选择流程并暂停自动保存），完成后再放行写请求门，
-    // 避免“新修订号 + 编辑前所见旧航线”被立刻条件写回
-    let conflicted = false;
+    // 仅他页改航线则直接采用远端；双方航线都变则走冲突选择流程并暂停自动
+    // 保存），完成后再放行写请求门，避免“新修订号 + 编辑前所见旧航线/旧
+    // 禁飞区”被立刻条件写回。再次 GET 失败时不放开门，阻断一切写入直到重试
+    let outcome = "ok";
     if (typeof r.workspaceRev === "number") {
-      conflicted = !(await reconcileWorkspaceRevIfPublished(seenRev));
+      outcome = await reconcileWorkspaceRevIfPublished(seenRev);
     }
+    if (outcome === "failed") return; // 就绪承诺保持挂起：所有写请求继续等待
     resolveReleaseReady(releaseState);
     renderNfzDraft();
-    replayWithheldWrite(conflicted);
+    replayWithheldWrite(outcome === "conflict");
   } else {
     releaseState = "none";
     currentRelease = null;
@@ -964,6 +1052,12 @@ function renderRelease(err) {
     box.innerHTML = `<div class="summary">正在确认发布状态…（发布状态明确前暂不自动保存工作区，编辑仍保留在本页）</div>`;
     return;
   }
+  if (workspaceCoordError) {
+    box.innerHTML = `<div class="error-line">⚠ 启动协调失败：两次读取之间工作区已被他页更新（修订号 ${workspaceRev}），但取回最新工作区失败。本页航线与禁飞区草稿已保留，自动保存及相邻核准/发布一律暂停——绝不会用新修订号把旧航线/旧禁飞区写回。<button id="btnCoordRetry" class="link-btn">重试</button>取回最新工作区后继续。</div>`;
+    const btn = $("#btnCoordRetry");
+    if (btn) btn.onclick = () => retryWorkspaceCoordination();
+    return;
+  }
   if (releaseState === "error") {
     box.innerHTML = `<div class="error-line">⚠ 发布状态读取失败：本页编辑已保留，但在确认发布状态前不会保存工作区，请刷新页面或<button id="btnReleaseRetry" class="link-btn">重试</button>。</div>`;
     const btn = $("#btnReleaseRetry");
@@ -1008,10 +1102,18 @@ async function publishVersion(v) {
     toast("请先解决航线冲突，再发布航线");
     return;
   }
+  if (workspaceCoordError) {
+    toast("启动协调未完成：请先点侧栏“重试”取回最新工作区，未继续发布");
+    return;
+  }
   try {
     await waitReleaseReady();
     await flushPendingSave();
   } catch (e) {
+    if (e instanceof WorkspaceCoordError) {
+      toast("启动协调未完成：请先点侧栏“重试”取回最新工作区，未继续发布");
+      return;
+    }
     if (e instanceof ReleaseUnavailableError) {
       toast("发布状态尚未确认或读取失败，请刷新页面后重试，未继续发布");
       return;
@@ -1126,10 +1228,18 @@ async function submitNfzApproval() {
     toast("请先解决航线冲突，再提交禁飞区核准");
     return;
   }
+  if (workspaceCoordError) {
+    toast("启动协调未完成：请先点侧栏“重试”取回最新工作区，未继续核准");
+    return;
+  }
   try {
     await waitReleaseReady();
     await flushPendingSave();
   } catch (e) {
+    if (e instanceof WorkspaceCoordError) {
+      toast("启动协调未完成：请先点侧栏“重试”取回最新工作区，未继续核准");
+      return;
+    }
     if (e instanceof ReleaseUnavailableError) {
       toast("发布状态尚未确认或读取失败，请刷新页面后重试，未继续核准");
       return;
@@ -1214,6 +1324,11 @@ async function loadVersions() {
       try {
         await saveStateNow(); // 已有发布时仅落库航线，版本带来的禁飞区变化留作草稿
       } catch (e) {
+        if (e instanceof WorkspaceCoordError) {
+          renderPanel(); fitView(); runAnalyze();
+          toast("启动协调未完成：版本已载入但未保存，请先点侧栏“重试”取回最新工作区");
+          return;
+        }
         if (e instanceof ReleaseUnavailableError) {
           renderPanel(); fitView(); runAnalyze();
           toast("发布状态尚未确认或读取失败：版本已载入但未保存，请刷新页面后重试");
