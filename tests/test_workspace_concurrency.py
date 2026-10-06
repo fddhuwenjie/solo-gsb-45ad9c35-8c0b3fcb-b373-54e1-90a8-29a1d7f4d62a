@@ -13,7 +13,9 @@
 - 保存与核准相邻：保存先落库后，核准须用保存返回的新修订号（旧号 409）；
 - 核准通过/失败均不改写发布快照。
 """
+import contextlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -399,6 +401,198 @@ class WorkspaceConcurrencyTests(unittest.TestCase):
         self.assertEqual(st["route"]["waypoints"][1]["alt"], 300)
         # 自动保存/核准全程不改写发布快照
         self.assertEqual(self.release_snapshot(self.page_b), snap)
+
+    # —— 启动交错：GET /api/state →（他页改航线/核准禁飞区、推进修订号）→ GET /api/release ——
+    def _setup_published_route_for_startup(self):
+        """发布 #1（快照航线 ROUTE），随后把工作区航线恢复为 ROUTE。
+        返回 (发布时修订号, 启动页 GET /api/state 所见修订号)。"""
+        _, rev = self.publish_route(self.page_a)
+        rev = self.put_ok(self.page_a, {"route": clone(ROUTE), "nfzs": []}, rev)
+        st, seen = self.get_state(self.page_b)
+        self.assertEqual(st["route"], ROUTE)
+        return rev, seen
+
+    def _broken_state_client(self):
+        """返回一个 GET /api/state 失败（模拟协调取回失败）的页面客户端。"""
+        client = app.app.test_client()
+        client.raise_server_exceptions = False
+        original_get_db = app.get_db
+
+        def broken_get_db():
+            raise RuntimeError("simulated GET /api/state failure")
+
+        app.get_db = broken_get_db
+        return client, original_get_db
+
+    def _restore_get_db(self, original_get_db):
+        app.get_db = original_get_db
+
+    @contextlib.contextmanager
+    def _silence_server_logs(self):
+        """屏蔽模拟 500 时 Flask 打印的服务端 traceback（响应本身仍为 500）。"""
+        loggers = [logging.getLogger("flask.app"), logging.getLogger("werkzeug"),
+                   app.app.logger]
+        saved = [lg.level for lg in loggers]
+        for lg in loggers:
+            lg.setLevel(logging.CRITICAL)
+        try:
+            yield
+        finally:
+            for lg, lvl in zip(loggers, saved):
+                lg.level = lvl
+
+    def test_startup_interleave_remote_only_route_change_is_adopted(self):
+        # B 页先 GET /api/state（rev=seen）；其间 A 页改航线并保存（rev=seen+1）；
+        # B 页随后 GET /api/release 发现修订号已推进、发布存在。
+        # 协议：B 页协调取回最新工作区后，仅他页改航线（本页航线未改）→
+        # 直接采用远端航线、不发起任何 PUT；协调 PUT 若误用“新修订号 + 旧航线”
+        # 会静默回滚 A 页航线——本测试钉死该写回必须不发生。
+        _, seen = self._setup_published_route_for_startup()
+        route_a = clone(ROUTE)
+        route_a["waypoints"][0]["name"] = "A页启动交错改名"
+        rev_after = self.put_ok(self.page_a, {"route": route_a, "nfzs": []}, seen)
+        self.assertEqual(rev_after, seen + 1)
+
+        # B 页读 /api/release：确认发布存在且工作区修订号已变
+        rel = self.page_b.get("/api/release").get_json()
+        self.assertEqual(rel["workspaceRev"], rev_after)
+        self.assertIsNotNone(rel["release"])
+        # B 页协调取回最新工作区（前端 GET /api/state）
+        fresh, fresh_rev = self.get_state(self.page_b)
+        self.assertEqual(fresh_rev, rev_after)
+        # 本页航线（编辑前所见）与远端航线比对：本页未改、远端改了 → 采用远端，
+        # 不写库。模拟前端语义：绝不 PUT。
+        self.assertEqual(fresh["route"]["waypoints"][0]["name"], "A页启动交错改名")
+        # 反面钉死：用 /api/release 的新修订号配 GET /api/state 所见旧航线写回，
+        # 正是要修复的事故——即便这样发了 PUT，服务端条件头也必须拦住：
+        # 前端此时持有的条件号若仍是 seen，则 409；服务器航线保持 A 页内容
+        r = self.put(self.page_b, {"route": clone(ROUTE), "nfzs": []}, seen)
+        self.assertEqual(r.status_code, 409)
+        st, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_after)
+        self.assertEqual(st["route"]["waypoints"][0]["name"], "A页启动交错改名")
+
+    def test_startup_interleave_both_routes_conflict_no_auto_write(self):
+        # 两页在启动交错窗口内各自改了航线：B 页取回最新工作区后进入冲突分流，
+        # 自动保存暂停——不自动写库；只有用户显式“确认提交本页航线”（最新号
+        # 条件 PUT）才落库，期间禁飞区草稿同样不落库。
+        _, seen = self._setup_published_route_for_startup()
+        route_b = clone(ROUTE)
+        route_b["waypoints"][1]["name"] = "B页启动航线"
+        route_a = clone(ROUTE)
+        route_a["waypoints"][0]["name"] = "A页启动航线"
+        rev_after = self.put_ok(self.page_a, {"route": route_a, "nfzs": []}, seen)
+
+        fresh, fresh_rev = self.get_state(self.page_b)
+        self.assertEqual(fresh_rev, rev_after)
+        # 前端判定：localChanged(route_b≠ROUTE) 且 remoteChanged(A页航线≠ROUTE)
+        # → 冲突分流，不自动 PUT。服务器仍只有 A 页航线
+        st, _ = self.get_state(self.page_b)
+        self.assertEqual(st["route"]["waypoints"][0]["name"], "A页启动航线")
+        self.assertEqual(st["route"]["waypoints"][1]["name"], "B")
+        # 旧号条件写必被拒
+        r = self.put(self.page_b, {"route": route_b, "nfzs": []}, seen)
+        self.assertEqual(r.status_code, 409)
+        # 显式确认提交（最新号）→ 成功，B 页航线落库
+        rev_b = self.put_ok(self.page_b, {"route": route_b, "nfzs": []}, fresh_rev)
+        st, _ = self.get_state(self.page_b)
+        self.assertEqual([w["name"] for w in st["route"]["waypoints"]],
+                         ["A", "B页启动航线"])
+        self.assertEqual(rev_b, rev_after + 1)
+        # 发布快照航线始终是 ROUTE
+        snap = self.release_snapshot(self.page_b)
+        self.assertEqual([w["name"] for w in snap["state"]["route"]["waypoints"]],
+                         ["A", "B"])
+
+    def test_startup_interleave_remote_approval_local_route_conditional_save(self):
+        # 交错窗口内他页仅核准禁飞区（远端航线未变），本页改了航线：
+        # 协调合入已核准禁飞区基线（本页禁飞区草稿不落库），用最新修订号
+        # 条件保存本页航线，请求体只带已核准禁飞区。
+        _, seen = self._setup_published_route_for_startup()
+        # A 页核准远侧禁飞区：修订号推进，航线不变
+        r = self.approve(self.page_a, [clone(FAR_NFZ)], seen, 1)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        rev_after = r.get_json()["rev"]
+
+        # B 页（启动中）持有本页航线编辑与一个禁飞区草稿
+        route_b = clone(ROUTE)
+        route_b["corridorHalfWidth"] = 0.42
+        draft_nfz = clone(BLOCK_NFZ)
+        draft_nfz["id"] = "draftOnly"
+
+        rel = self.page_b.get("/api/release").get_json()
+        self.assertEqual(rel["workspaceRev"], rev_after)
+        fresh, fresh_rev = self.get_state(self.page_b)
+        self.assertEqual(fresh_rev, rev_after)
+        self.assertEqual(fresh["route"], ROUTE)          # 远端航线未变
+        self.assertEqual(fresh["nfzs"], [FAR_NFZ])       # 他页已核准禁飞区
+        # 合入后：本页航线用最新号条件保存，请求体禁飞区为已核准基线 FAR_NFZ，
+        # 本页草稿 BLOCK 禁飞区不在请求中
+        rev_b = self.put_ok(self.page_b,
+                            {"route": route_b, "nfzs": [clone(FAR_NFZ)]},
+                            fresh_rev)
+        st, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_b)
+        self.assertEqual(st["route"]["corridorHalfWidth"], 0.42)
+        self.assertEqual(st["nfzs"], [FAR_NFZ])          # 草稿绝未落库
+
+    def test_startup_reconcile_fetch_failure_blocks_pending_save_until_retry(self):
+        # 交错窗口内他页核准禁飞区并推进修订号；B 页启动协调所需的再次
+        # GET /api/state 失败：必须保留本页航线/禁飞区草稿、不放行待发保存，
+        # 绝不拿 /api/release 的新修订号把旧航线+旧禁飞区整份写回；
+        # 重试取回最新工作区后，才按最新修订号条件保存本页航线（合入已核准禁飞区）。
+        _, seen = self._setup_published_route_for_startup()
+        route_b = clone(ROUTE)
+        route_b["unitScale"] = 120
+        # A 页在 B 页两次读取之间核准禁飞区
+        r = self.approve(self.page_a, [clone(FAR_NFZ)], seen, 1)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        rev_after = r.get_json()["rev"]
+
+        # B 页 GET /api/release 成功：发布存在、修订号已推进
+        rel = self.page_b.get("/api/release").get_json()
+        self.assertEqual(rel["workspaceRev"], rev_after)
+        # 随后协调 GET /api/state 失败（网络/500）
+        broken, original_get_db = self._broken_state_client()
+        try:
+            with self._silence_server_logs():
+                r = broken.get("/api/state")
+            self.assertEqual(r.status_code, 500)
+        finally:
+            self._restore_get_db(original_get_db)
+
+        # 协调失败期间：服务端工作区保持 A 页已核准状态，B 页不得写入
+        st, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_after)
+        self.assertEqual(st["nfzs"], [FAR_NFZ])
+        self.assertEqual(st["route"], ROUTE)
+        # 前端持有的条件号仍是 GET /api/state 所见的 seen：任何误发的条件 PUT
+        # 都被 409 拒绝，旧航线/旧禁飞区整份写回不可能落库
+        r = self.put(self.page_b, {"route": route_b, "nfzs": []}, seen)
+        self.assertEqual(r.status_code, 409)
+        st, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(st["nfzs"], [FAR_NFZ])
+        self.assertEqual(st["route"], ROUTE)
+        self.assertEqual(hdr_rev, rev_after)
+        # 未核准/发布相邻写入同样被门控（前端不发请求）：这里钉死服务端侧
+        # 旧号核准必 409，且即便通过了并发检查，快照航线也不被改写
+        r = self.approve(self.page_b, [], seen, 1)
+        self.assertEqual(r.status_code, 409)
+
+        # 重试：GET /api/state 恢复，B 页取回最新工作区（合入 FAR_NFZ 基线），
+        # 本页航线按最新修订号条件保存，草稿（此处无）不落库
+        fresh, fresh_rev = self.get_state(self.page_b)
+        self.assertEqual(fresh["nfzs"], [FAR_NFZ])
+        rev_b = self.put_ok(self.page_b,
+                            {"route": route_b, "nfzs": [clone(FAR_NFZ)]},
+                            fresh_rev)
+        st, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_b)
+        self.assertEqual(st["route"]["unitScale"], 120)
+        self.assertEqual(st["nfzs"], [FAR_NFZ])
+        # 发布快照航线不变
+        snap = self.release_snapshot(self.page_b)
+        self.assertEqual(snap["state"]["route"], ROUTE)
 
 
 if __name__ == "__main__":
